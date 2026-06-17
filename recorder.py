@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# keyed by (venue, stream) so spot/perp btcusdt don't clobber each other
+# keyed by (venue, stream) so spot/perp btcusdt don't interact with each other
 last_u: dict[tuple[str, str], int] = {}
 
 
@@ -53,12 +53,11 @@ def check_gap(venue: str, stream: str, msg: dict) -> None:
     key = (venue, stream)
     prev = last_u.get(key)
     if venue == "perp":
-        # futures continuity: this event's pu must equal the previous event's u
         pu = msg.get("pu")
         if prev is not None and pu != prev:
             log.warning("GAP %s %s: prev u=%s got pu=%s", venue, stream, prev, pu)
     else:
-        # spot continuity: this event's U must be previous u + 1
+        # spot continuity: this event's U must be previous u + 1 -> gap detection
         U = msg["U"]
         if prev is not None and U != prev + 1:
             log.warning(
@@ -72,7 +71,7 @@ def build_stream_path(symbols: list[str]) -> str:
     parts = []
     for s in symbols:
         parts.append(f"{s}@depth@100ms")  # L2 diff stream at 100 ms granularity
-        parts.append(f"{s}@trade")        # individual trade stream (every matched order)
+        parts.append(f"{s}@trade")        
     return "/".join(parts)
 
 
@@ -93,8 +92,6 @@ def _fetch_snapshot(venue: str, symbol: str) -> dict:
 
 
 async def write_snapshots(venue: str, fh, reset: bool) -> None:
-    # A diff stream is unreconstructible without a seed snapshot (carries lastUpdateId).
-    # Written into each file so every file is independently replayable into a book.
     for sym in SYMBOLS[venue]:
         if reset:
             last_u.pop((venue, f"{sym}@depth@100ms"), None)
@@ -110,7 +107,7 @@ async def write_snapshots(venue: str, fh, reset: bool) -> None:
 async def record_venue(venue: str) -> None:
     url = ENDPOINTS[venue] + build_stream_path(SYMBOLS[venue])
 
-    while True:  # reconnect loop
+    while True:  # reconnect until stopped loop
         try:
             async with websockets.connect(
                 url,
