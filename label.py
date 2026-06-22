@@ -2,12 +2,8 @@ import pandas as pd                                       # events.parquet is wr
 from book import read_records, Book, in_order, is_first  # reuse the sync primitives from the reconstructor
 
 
-TRADE_WINDOW_MS = 2000                                   # how long (exchange ms) a trade stays eligible to
-#                                                        # explain a later book decrease before we give up on it
-
-
 def level_deltas(book, ev):                              # what changed, per price level, BEFORE applying ev
-    out = []                                             # list of (side, price, change) tuples
+    out = {}                                             # (side, price) -> signed change
     for code, levels in (("bid", ev["b"]), ("ask", ev["a"])):  # walk both sides of the diff
         side = book.bids if code == "bid" else book.asks       # the matching live dict on the book
         for p, q in levels:                             # each level is [price_str, new_qty_str]
@@ -15,24 +11,8 @@ def level_deltas(book, ev):                              # what changed, per pri
             oldq = side.get(price, 0.0)                 # resting size before this update (0 if level was empty)
             change = newq - oldq                        # signed change at this price
             if change != 0.0:                           # a restated-but-identical size carries no event
-                out.append((code, price, change))       # positive => add, negative => removal
-    return out                                          # caller classifies each change
-
-
-def attribute(trades, side, price, E, need):            # consume buffered trades to explain a book decrease
-    matched = 0.0                                       # how much of `need` we managed to back with real trades
-    for tr in trades:                                   # FIFO over the eligible-trade buffer
-        if matched >= need:                             # decrease already fully explained
-            break                                       # stop early
-        tE, tside, tprice, tq = tr                      # buffered trade: exch time, side hit, price, qty left
-        if tside != side or tprice != price:            # a trade only explains a decrease on the side and
-            continue                                    # price level it actually executed against
-        if tE > E:                                      # this trade is newer than the depth window we're in,
-            continue                                    # so it can't have caused this particular decrease yet
-        take = min(tq, need - matched)                  # consume as much as this trade and the gap allow
-        tr[3] -= take                                   # shrink the trade's remaining unexplained-by-book qty
-        matched += take                                 # and credit it toward the decrease
-    return matched                                      # residual (need - matched) is treated as a cancellation
+                out[(code, price)] = change             # positive => net add, negative => net removal
+    return out                                          # caller reconciles these against executions
 
 
 def label(path, symbol="btcusdt", venue="spot"):        # turn one symbol's raw log into a labeled event stream
@@ -41,10 +21,10 @@ def label(path, symbol="btcusdt", venue="spot"):        # turn one symbol's raw 
     snap_name = f"{symbol}@snapshot"                    # the seed-snapshot record name
     book = Book()                                       # live book, seeded then driven by diffs
     seeded = started = False                            # consumed snapshot? locked onto the diff sequence?
-    trades = []                                         # rolling buffer of recent trades: [E, side, price, qty]
+    pending = []                                        # trades awaiting their depth window: [E, side, price, qty, t]
     events = []                                         # output rows we will turn into events.parquet
-    trade_vol = matched_vol = 0.0                       # totals for the missed-execution quality metric
-    gaps = 0                                            # diff-continuity breaks (labeling is unreliable across one)
+    trade_vol = corroborated = 0.0                      # total executed volume, and how much the book confirmed
+    gaps = 0                                            # diff-continuity breaks (labeling unreliable across one)
 
     for rec in read_records(path):                      # single pass over the log, in record order
         name, d, t = rec["s"], rec["d"], rec["t"]       # stream name, payload, local arrival timestamp (ns)
@@ -54,11 +34,11 @@ def label(path, symbol="btcusdt", venue="spot"):        # turn one symbol's raw 
             seeded = True                               # and start watching for the first usable diff
             continue
 
-        if name == trade and seeded:                    # a public trade: buffer it for later attribution
+        if name == trade and seeded:                    # a public trade: queue it for its depth window
             side = "bid" if d["m"] else "ask"           # m=True => seller was taker, so a resting BID was hit;
             #                                           # m=False => buyer was taker, so a resting ASK was hit
-            trades.append([d["E"], side, float(d["p"]), float(d["q"])])  # record it with its qty still unexplained
-            trade_vol += float(d["q"])                  # count every traded unit toward the denominator
+            pending.append([d["E"], side, float(d["p"]), float(d["q"]), t])  # exch time, side, price, qty, arrival
+            trade_vol += float(d["q"])                  # the trade stream is ground truth for executions
             continue
 
         if name != depth or not seeded:                 # ignore other symbols / pre-seed diffs
@@ -77,35 +57,43 @@ def label(path, symbol="btcusdt", venue="spot"):        # turn one symbol's raw 
             gaps += 1                                   # deltas around the hole will be wrong; flag, don't trust
 
         E = d["E"]                                      # exchange time of this depth update (ms)
-        trades[:] = [tr for tr in trades                # expire the buffer: drop trades too old to still be
-                     if tr[0] >= E - TRADE_WINDOW_MS and tr[3] > 1e-12]  # relevant, or already fully explained
+        delta = level_deltas(book, d)                   # net book change per level over this 100 ms window
 
-        for side, price, change in level_deltas(book, d):   # classify every level change in this update
-            if change > 0.0:                            # size grew (or a new level appeared)
-                events.append((t, E, "insert", side, price, change))    # a limit-order insertion
-            else:                                       # size shrank at this level
-                dec = -change                           # the magnitude of the decrease to be explained
-                m = attribute(trades, side, price, E, dec)  # how much real trade volume backs it
-                if m > 1e-12:                           # part (or all) of it was an execution
-                    events.append((t, E, "market", side, price, m))     # a marketable-order hit
-                    matched_vol += m                    # credit it toward the attributed-trade total
-                resid = dec - m                         # whatever the trade stream could not explain
-                if resid > 1e-12:                       # ... is taken to be a cancellation
-                    events.append((t, E, "cancel", side, price, resid)) # a limit-order cancellation
+        execed = {}                                     # executions assigned to THIS window, summed per level
+        keep = []                                       # trades that belong to a later window
+        for tr in pending:                              # drain every trade whose exch time precedes this update
+            if tr[0] <= E:                              # this trade executed within (or before) this window
+                events.append((tr[4], tr[0], "market", tr[1], tr[2], tr[3]))  # emit it at its own real timing
+                execed[(tr[1], tr[2])] = execed.get((tr[1], tr[2]), 0.0) + tr[3]  # tally execs at this level
+            else:                                       # newer than this depth window -> defer it
+                keep.append(tr)
+        pending = keep                                  # only future-window trades remain queued
 
-        book.apply(d)                                   # advance the book now that the diff has been labeled
+        for key in delta.keys() | execed.keys():        # reconcile every level touched by a diff OR a trade
+            net = delta.get(key, 0.0)                   # observed net size change (0 if level absent from diff)
+            X = execed.get(key, 0.0)                    # executions there this window (already emitted above)
+            corroborated += min(X, max(0.0, -net))      # how much of the execution the book independently showed
+            signed = net + X                            # net = inserts - cancels - execs  =>  inserts - cancels
+            if signed > 1e-12:                          # the level grew once executions are accounted for
+                events.append((t, E, "insert", key[0], key[1], signed))     # net limit-order insertion
+            elif signed < -1e-12:                       # the level shrank beyond what executions explain
+                events.append((t, E, "cancel", key[0], key[1], -signed))    # net limit-order cancellation
+
+        book.apply(d)                                   # advance the book now that the window has been labeled
 
     df = pd.DataFrame(events, columns=["t", "E", "type", "side", "price", "qty"])  # assemble the event table
+    df = df.sort_values("t", kind="stable").reset_index(drop=True)  # true observation order (markets at trade time)
     out = f"events_{venue}_{symbol}.parquet"            # one parquet per symbol/venue for now
     df.to_parquet(out, index=False)                     # persist the labeled stream
 
-    miss = 1.0 - (matched_vol / trade_vol if trade_vol else 0.0)  # fraction of trade volume with no book decrease
+    tail = sum(tr[3] for tr in pending)                 # trades after the final depth window (never reconciled)
     return out, {                                       # report card for the week-2 exit criterion
         "events": len(df),                              # total labeled events
         "by_type": df["type"].value_counts().to_dict(), # insert / market / cancel breakdown
-        "trade_vol": round(trade_vol, 4),               # total executed volume seen on the trade stream
-        "matched_vol": round(matched_vol, 4),           # how much of it we tied to a book decrease
-        "unattributed_trade_rate": round(miss, 4),      # the quality metric — want this < a few %
+        "trade_vol": round(trade_vol, 4),               # total executed volume from the trade stream (all attributed)
+        "book_corroborated_rate": round(corroborated / trade_vol, 4) if trade_vol else 0.0,  # data-quality stat:
+        #                                               # fraction of executions the 100 ms diff also showed as a drop
+        "unattributed_vol": round(tail, 4),             # executions we could NOT place in a window (want ~0)
         "gaps": gaps,                                   # diff holes encountered
     }
 
