@@ -1,15 +1,33 @@
 import gzip                                              # raw logs are gzip-compressed jsonl
+import io                                                # wrap the byte buffer for streaming decompression
 import json                                              # each line is one JSON record
-from dataclasses import dataclass, field                
+import zlib                                              # gzip raises zlib.error on a corrupt member
+from dataclasses import dataclass, field
 
 
-def read_records(path):                                 # stream records from one .jsonl.gz log
-    with gzip.open(path, "rt") as f:                    # text mode: yields decoded str lines
-        try:                                            # the recorder may have been hard-killed,
-            for line in f:                              # leaving the final gzip member truncated;
-                yield json.loads(line)                  # parse and hand back one record at a time
-        except EOFError:                                # truncated tail -> stop cleanly,
-            return                                      # everything before the last flush is valid
+def read_records(path):                                 # stream records from one .jsonl.gz log, corruption-tolerant
+    raw = open(path, "rb").read()                       # the daily log is a sequence of concatenated gzip members;
+    n = len(raw)                                         # a single corrupt member must not strand the valid ones after it
+    pos = 0                                             # byte offset of the next member to try
+    buf = b""                                           # carry partial trailing line across decompression chunks
+    while pos < n:                                       # walk the file member-group by member-group
+        gz = gzip.GzipFile(fileobj=io.BytesIO(raw[pos:]))   # decode from here until a member goes bad
+        try:
+            while True:                                 # pull decompressed bytes in chunks
+                chunk = gz.read(1 << 20)                # 1 MB of decompressed text at a time
+                if not chunk:                           # clean end of the readable run
+                    return                              # everything decodable has been yielded
+                buf += chunk                            # append and split into whole lines
+                *lines, buf = buf.split(b"\n")          # keep the last (possibly partial) fragment in buf
+                for ln in lines:                        # hand back each complete record
+                    if ln.strip():                      # skip blank lines
+                        yield json.loads(ln)
+        except (EOFError, zlib.error, OSError):         # this member is corrupt -> resync to the next one
+            nxt = raw.find(b"\x1f\x8b", pos + 2)        # scan forward to the next gzip magic (1f 8b)
+            if nxt < 0:                                 # no more members -> we are done
+                return
+            pos = nxt                                   # restart decompression at the next member
+            buf = b""                                   # drop the partial line spanning the corrupt seam
 
 
 @dataclass                                              # mutable container for one symbol's book
