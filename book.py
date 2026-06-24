@@ -34,25 +34,43 @@ def read_records(path):                                 # stream records from on
 class Book:
     bids: dict = field(default_factory=dict)            # price(float) -> resting quantity(float)
     asks: dict = field(default_factory=dict)            # price(float) -> resting quantity(float)
+    bid_u: dict = field(default_factory=dict)           # price -> update id that last touched this bid level
+    ask_u: dict = field(default_factory=dict)           # price -> update id that last touched this ask level
     last_u: int = 0                                     # final update id of the last applied event
 
     def seed(self, snap):                               # initialise from a REST depth snapshot
         self.bids = {float(p): float(q) for p, q in snap["bids"]}   # snapshot bid levels
         self.asks = {float(p): float(q) for p, q in snap["asks"]}   # snapshot ask levels
         self.last_u = snap["lastUpdateId"]              # the sequence id this snapshot is current to
+        self.bid_u = {p: self.last_u for p in self.bids}   # every seeded level is current as of the snapshot
+        self.ask_u = {p: self.last_u for p in self.asks}
 
-    def apply_side(self, side, levels):                 # apply one side's price/qty deltas
+    def apply_side(self, side, stamp, levels, u):       # apply one side's price/qty deltas, stamping each level
         for p, q in levels:                             # each level is [price_str, qty_str]
             price, qty = float(p), float(q)             # Binance sends decimal strings
             if qty == 0.0:                              # zero quantity means the level is now empty
                 side.pop(price, None)                   # remove it (may already be absent)
+                stamp.pop(price, None)                  # and forget when it was last seen
             else:                                       # otherwise the diff is an absolute new size,
                 side[price] = qty                       # not an increment -> overwrite
+                stamp[price] = u                        # record the update that set it (for stale-level pruning)
+
+    def prune(self):                                    # an ask at/below a bid is economically impossible:
+        while self.bids and self.asks:                  # the offending level is leftover deep-book data Binance
+            bb, ba = max(self.bids), min(self.asks)     # updates lazily, so it lags reality -> drop the staler one
+            if ba > bb:                                 # book no longer crossed -> done
+                return
+            if self.bid_u.get(bb, 0) <= self.ask_u.get(ba, 0):  # whichever touch level was set longer ago
+                self.bids.pop(bb, None); self.bid_u.pop(bb, None)   # is the stale one -> remove it
+            else:
+                self.asks.pop(ba, None); self.ask_u.pop(ba, None)
 
     def apply(self, ev):                                # apply one depthUpdate event to the book
-        self.apply_side(self.bids, ev["b"])            # b = bid-side level updates
-        self.apply_side(self.asks, ev["a"])            # a = ask-side level updates
-        self.last_u = ev["u"]                          # advance our sequence cursor
+        u = ev["u"]                                     # this event's final update id stamps every level it sets
+        self.apply_side(self.bids, self.bid_u, ev["b"], u)   # b = bid-side level updates
+        self.apply_side(self.asks, self.ask_u, ev["a"], u)   # a = ask-side level updates
+        self.last_u = u                                 # advance our sequence cursor
+        self.prune()                                    # keep the book uncrossed by evicting stale levels
 
     def best_bid(self):                                 # highest price anyone is willing to buy at
         return max(self.bids) if self.bids else None    # None if the side is somehow empty

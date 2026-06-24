@@ -5,3 +5,5 @@ roadmap_qr_posts.md
 data/
 *.log
 __pycache__/
+
+CHANGES.md
