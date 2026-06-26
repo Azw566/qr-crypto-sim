@@ -28,7 +28,7 @@ REST = {
 
 DATA_DIR = "data"
 RECONNECT_DELAY = 5
-FLUSH_INTERVAL = 1.0     # seconds between gzip flushes (bounds data lost on kill)
+FLUSH_INTERVAL = 1.0
 SNAPSHOT_LIMIT = 1000
 
 logging.basicConfig(
@@ -43,7 +43,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# keyed by (venue, stream) so spot/perp btcusdt don't interact with each other
 last_u: dict[tuple[str, str], int] = {}
 
 
@@ -57,7 +56,6 @@ def check_gap(venue: str, stream: str, msg: dict) -> None:
         if prev is not None and pu != prev:
             log.warning("GAP %s %s: prev u=%s got pu=%s", venue, stream, prev, pu)
     else:
-        # spot continuity: this event's U must be previous u + 1 -> gap detection
         U = msg["U"]
         if prev is not None and U != prev + 1:
             log.warning(
@@ -70,8 +68,8 @@ def check_gap(venue: str, stream: str, msg: dict) -> None:
 def build_stream_path(symbols: list[str]) -> str:
     parts = []
     for s in symbols:
-        parts.append(f"{s}@depth@100ms")  # L2 diff stream at 100 ms granularity
-        parts.append(f"{s}@trade")        
+        parts.append(f"{s}@depth@100ms")
+        parts.append(f"{s}@trade")
     return "/".join(parts)
 
 
@@ -107,7 +105,7 @@ async def write_snapshots(venue: str, fh, reset: bool) -> None:
 async def record_venue(venue: str) -> None:
     url = ENDPOINTS[venue] + build_stream_path(SYMBOLS[venue])
 
-    while True:  # reconnect until stopped loop
+    while True:
         try:
             async with websockets.connect(
                 url,
@@ -117,13 +115,12 @@ async def record_venue(venue: str) -> None:
                 log.info("connected %s", venue)
                 date_str = today_str()
                 fh = open_outfile(venue, date_str)
-                # snapshot AFTER the socket is open so buffered diffs cover the seam
                 await write_snapshots(venue, fh, reset=True)
                 last_flush = time.monotonic()
 
                 try:
                     async for raw in ws:
-                        now = time.time_ns()  # wall-clock ns; compare against Binance E
+                        now = time.time_ns()
 
                         new_date = today_str()
                         if new_date != date_str:
@@ -149,7 +146,7 @@ async def record_venue(venue: str) -> None:
                 except Exception as e:
                     log.error("stream error %s: %s", venue, e)
                 finally:
-                    fh.close()  # close() finalizes the gzip member and flushes
+                    fh.close()
 
         except asyncio.CancelledError:
             log.info("shutting down %s", venue)
@@ -170,7 +167,7 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, AttributeError):
-            pass  # Windows ProactorEventLoop: fall back to KeyboardInterrupt
+            pass
 
     await stop.wait()
     log.info("signal received, draining …")
