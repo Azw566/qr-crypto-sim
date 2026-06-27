@@ -1,48 +1,101 @@
+import glob
 import numpy as np
 import pandas as pd
 from book import read_records, Book, in_order, is_first
 
+SYMBOLS = {
+    "spot": ["btcusdt", "ethusdt", "solusdt", "bnbusdt"],
+    "perp": ["btcusdt"],
+}
 
-def collect(path, symbol="btcusdt", venue="spot"):
-    depth = f"{symbol}@depth@100ms"
-    trade = f"{symbol}@trade"
-    snap_name = f"{symbol}@snapshot"
-    book = Book()
-    seeded = started = False
-    seg = 0
 
-    bE, bid_px, mid, spr, bq, aq, bseg = [], [], [], [], [], [], []
-    tE, tsign, tseg = [], [], []
+def collect(venue, symbols=None):
+    symbols = symbols or SYMBOLS[venue]
+    routes = {}
+    for s in symbols:
+        routes[f"{s}@depth@100ms"] = (s, "depth")
+        routes[f"{s}@trade"] = (s, "trade")
+        routes[f"{s}@snapshot"] = (s, "snap")
 
-    for rec in read_records(path):
-        name, d = rec["s"], rec["d"]
-        if name == snap_name and not seeded:
-            book.seed(d); seeded = True; continue
-        if name == trade and seeded:
-            tsign.append(1 if not d["m"] else -1)
-            tE.append(d["E"]); tseg.append(seg)
-            continue
-        if name != depth or not seeded:
-            continue
-        if not started:
-            if d["u"] <= book.last_u: continue
-            if not is_first(venue, d, book.last_u): continue
-            book.apply(d); started = True; continue
-        if not in_order(venue, d, book.last_u):
-            seg += 1
-        book.apply(d)
-        bb, ba = book.best_bid(), book.best_ask()
-        if bb is None or ba is None:
-            continue
-        bE.append(d["E"]); bid_px.append(bb)
-        mid.append((bb + ba) / 2); spr.append(ba - bb)
-        bq.append(book.bids[bb]); aq.append(book.asks[ba])
-        bseg.append(seg)
+    st = {s: {"book": Book(), "seeded": False, "started": False, "seg": 0} for s in symbols}
+    rows = {s: {"bE": [], "bid_px": [], "mid": [], "spr": [], "bq": [], "aq": [], "bseg": [],
+                "tE": [], "tsign": [], "tseg": []} for s in symbols}
 
+    for path in sorted(glob.glob(f"data/{venue}_*.jsonl.gz")):
+        for s in symbols:
+            S = st[s]
+            S["book"] = Book(); S["seeded"] = False; S["started"] = False
+            S["seg"] += 1
+
+        for rec in read_records(path):
+            hit = routes.get(rec["s"])
+            if hit is None:
+                continue
+            s, kind = hit
+            S = st[s]
+            d = rec["d"]
+
+            if kind == "snap":
+                if not S["seeded"]:
+                    S["book"].seed(d); S["seeded"] = True
+                continue
+            if not S["seeded"]:
+                continue
+            if kind == "trade":
+                rows[s]["tsign"].append(1 if not d["m"] else -1)
+                rows[s]["tE"].append(d["E"]); rows[s]["tseg"].append(S["seg"])
+                continue
+
+            book = S["book"]
+            if not S["started"]:
+                if d["u"] <= book.last_u:
+                    continue
+                if not is_first(venue, d, book.last_u):
+                    continue
+                book.apply(d); S["started"] = True
+                continue
+            if not in_order(venue, d, book.last_u):
+                S["seg"] += 1
+            book.apply(d)
+            book.trim()
+            bb, ba = book.best_bid(), book.best_ask()
+            if bb is None or ba is None:
+                continue
+            r = rows[s]
+            r["bE"].append(d["E"]); r["bid_px"].append(bb)
+            r["mid"].append((bb + ba) / 2); r["spr"].append(ba - bb)
+            r["bq"].append(book.bids[bb]); r["aq"].append(book.asks[ba])
+            r["bseg"].append(S["seg"])
+
+    out = {}
+    for s in symbols:
+        d = {k: np.array(v) for k, v in rows[s].items()}
+        d["segments"] = int(st[s]["seg"]) + 1
+        out[s] = d
+    return out
+
+
+def persist(venue, data):
+    for s, d in data.items():
+        pd.DataFrame({
+            "E": d["bE"], "bid_px": d["bid_px"], "mid": d["mid"],
+            "spr": d["spr"], "bq": d["bq"], "aq": d["aq"], "seg": d["bseg"],
+        }).to_parquet(f"samples_{venue}_{s}_book.parquet", index=False)
+        pd.DataFrame({
+            "E": d["tE"], "sign": d["tsign"], "seg": d["tseg"],
+        }).to_parquet(f"samples_{venue}_{s}_trade.parquet", index=False)
+
+
+def load(venue, symbol):
+    b = pd.read_parquet(f"samples_{venue}_{symbol}_book.parquet")
+    t = pd.read_parquet(f"samples_{venue}_{symbol}_trade.parquet")
+    segs = max(int(b["seg"].max()) if len(b) else 0, int(t["seg"].max()) if len(t) else 0) + 1
     return {
-        "bE": np.array(bE), "bid_px": np.array(bid_px), "mid": np.array(mid),
-        "spr": np.array(spr), "bq": np.array(bq), "aq": np.array(aq), "bseg": np.array(bseg),
-        "tE": np.array(tE), "tsign": np.array(tsign), "tseg": np.array(tseg), "segments": seg + 1,
+        "bE": b["E"].to_numpy(), "bid_px": b["bid_px"].to_numpy(), "mid": b["mid"].to_numpy(),
+        "spr": b["spr"].to_numpy(), "bq": b["bq"].to_numpy(), "aq": b["aq"].to_numpy(),
+        "bseg": b["seg"].to_numpy(),
+        "tE": t["E"].to_numpy(), "tsign": t["sign"].to_numpy(), "tseg": t["seg"].to_numpy(),
+        "segments": segs,
     }
 
 
@@ -58,8 +111,10 @@ def autocorr(x, lags):
     return {k: float(np.dot(x[:-k], x[k:]) / v) for k in lags}
 
 
-def report(path, symbol="btcusdt", venue="spot"):
-    d = collect(path, symbol, venue)
+def report(d, symbol="btcusdt", venue="spot"):
+    if d["mid"].size == 0:
+        print(f"=== {symbol} {venue} | no book data ===")
+        return
     tick = infer_tick(d["bid_px"])
     span_h = (d["bE"][-1] - d["bE"][0]) / 3.6e6
 
@@ -92,8 +147,11 @@ def report(path, symbol="btcusdt", venue="spot"):
     print("\n-- imbalance -> next-event mid move (ticks) --")
     print(curve.to_string())
     print("\n-- inter-trade duration (s) --")
-    print(f"  median: {np.median(dt):.3f}   mean: {dt.mean():.3f}   "
-          f"CV: {dt.std()/dt.mean():.2f}   (CV>1 => clustered)")
+    if dt.size:
+        print(f"  median: {np.median(dt):.3f}   mean: {dt.mean():.3f}   "
+              f"CV: {dt.std()/dt.mean():.2f}   (CV>1 => clustered)")
+    else:
+        print("  (no within-segment trade pairs)")
     print("\n-- trade-sign autocorrelation --")
     for k, v in ac.items():
         print(f"  lag {k:>3}: {v:+.3f}")
@@ -101,4 +159,9 @@ def report(path, symbol="btcusdt", venue="spot"):
 
 
 if __name__ == "__main__":
-    report("data/spot_20260617.jsonl.gz")
+    for venue in SYMBOLS:
+        data = collect(venue)
+        persist(venue, data)
+        for symbol, d in data.items():
+            report(d, symbol, venue)
+            print()

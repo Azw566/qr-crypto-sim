@@ -72,6 +72,16 @@ class Book:
         self.last_u = u
         self.prune()
 
+    def trim(self, cap=2000):
+        if len(self.bids) > cap:
+            keep = sorted(self.bids, reverse=True)[: cap * 3 // 4]
+            self.bids = {p: self.bids[p] for p in keep}
+            self.bid_u = {p: self.bid_u[p] for p in keep if p in self.bid_u}
+        if len(self.asks) > cap:
+            keep = sorted(self.asks)[: cap * 3 // 4]
+            self.asks = {p: self.asks[p] for p in keep}
+            self.ask_u = {p: self.ask_u[p] for p in keep if p in self.ask_u}
+
     def best_bid(self):
         return max(self.bids) if self.bids else None
     def best_ask(self):
