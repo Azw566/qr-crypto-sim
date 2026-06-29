@@ -111,12 +111,31 @@ def autocorr(x, lags):
     return {k: float(np.dot(x[:-k], x[k:]) / v) for k in lags}
 
 
+def aggregate_trades(tE, tsign, tseg):
+    if tE.size == 0:
+        return tE, tsign, tseg
+    run = (tE[1:] == tE[:-1]) & (tsign[1:] == tsign[:-1]) & (tseg[1:] == tseg[:-1])
+    keep = np.concatenate(([True], ~run))
+    return tE[keep], tsign[keep], tseg[keep]
+
+
+def covered_hours(E, seg):
+    if E.size == 0:
+        return 0.0
+    total = 0.0
+    for g in np.unique(seg):
+        e = E[seg == g]
+        if e.size > 1:
+            total += e[-1] - e[0]
+    return total / 3.6e6
+
+
 def report(d, symbol="btcusdt", venue="spot"):
     if d["mid"].size == 0:
         print(f"=== {symbol} {venue} | no book data ===")
         return
     tick = infer_tick(d["bid_px"])
-    span_h = (d["bE"][-1] - d["bE"][0]) / 3.6e6
+    cov_h = covered_hours(d["bE"], d["bseg"])
 
     spr_ticks = d["spr"] / tick
     imb = (d["bq"] - d["aq"]) / (d["bq"] + d["aq"])
@@ -129,14 +148,17 @@ def report(d, symbol="btcusdt", venue="spot"):
     tbl["bucket"] = pd.cut(tbl["imb"], bins)
     curve = tbl.groupby("bucket", observed=True)["nxt"].agg(["mean", "count"])
 
-    dt = np.diff(d["tE"]) / 1000.0
-    dt = dt[d["tseg"][:-1] == d["tseg"][1:]]
+    aE, asign, aseg = aggregate_trades(d["tE"], d["tsign"], d["tseg"])
+
+    dt = np.diff(aE) / 1000.0
+    dt = dt[aseg[:-1] == aseg[1:]]
     dt = dt[dt >= 0]
 
-    ac = autocorr(d["tsign"].astype(float), [1, 2, 5, 10, 50, 100])
+    ac = autocorr(asign.astype(float), [1, 2, 5, 10, 50, 100])
 
-    print(f"=== {symbol} {venue} | {span_h:.2f}h | {d['segments']} segment(s) | tick={tick:g} ===")
-    print(f"book updates: {d['mid'].size:,}   trades: {d['tsign'].size:,}")
+    print(f"=== {symbol} {venue} | {cov_h:.2f}h covered | {d['segments']} segment(s) | tick={tick:g} ===")
+    print(f"book updates: {d['mid'].size:,}   trade prints: {d['tsign'].size:,}   "
+          f"market orders: {asign.size:,}")
     print("\n-- spread --")
     print(f"  median: {np.median(d['spr']):.2f}  ({np.median(spr_ticks):.2f} ticks)   "
           f"mean: {d['spr'].mean():.3f}   at 1 tick: {100*np.mean(spr_ticks <= 1.0 + 1e-6):.1f}%   "
